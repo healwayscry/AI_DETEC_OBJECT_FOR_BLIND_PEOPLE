@@ -2,109 +2,126 @@ import cv2
 import time
 import threading
 import os
+import json
 from ultralytics import YOLO
 from gtts import gTTS
 import pygame
+from transformers import MarianMTModel, MarianTokenizer
 
-# ===== INIT AUDIO =====
-pygame.mixer.init()
+# ================== CẤU HÌNH FILE LƯU TRỮ ==================
+TRANSLATION_FILE = "translations.json"
+MODEL_PATH = "runs/detect/train/weights/best.pt"
 
-def speak(text):
-    def run():
-        try:
-            filename = "voice.mp3"
+# Load YOLO
+model = YOLO(MODEL_PATH) if os.path.exists(MODEL_PATH) else YOLO("yolov8n.pt")
 
-            tts = gTTS(text=text, lang='vi')
-            tts.save(filename)
-
-            pygame.mixer.music.load(filename)
-            pygame.mixer.music.play()
-
-            while pygame.mixer.music.get_busy():
-                time.sleep(0.1)
-
-            pygame.mixer.music.stop()
-            pygame.mixer.music.unload()
-
-            os.remove(filename)
-
-        except:
-            pass
-
-    threading.Thread(target=run).start()
-
-# ===== LOAD YOLOv8 =====
-model = YOLO("yolov8n.pt")  
-
-# ===== MAP TIẾNG VIỆT =====
+#Important
 label_map = {
-    "person": "người",
-    "cell phone": "điện thoại",
-    "bottle": "chai",
-    "chair": "ghế",
-    "laptop": "máy tính",
-    "car": "xe",
-    "dog": "chó",
-    "cat": "mèo"
+    "person": "người", "cell phone": "điện thoại", "bottle": "chai nước",
+    "chair": "cái ghế", "laptop": "máy tính", "car": "xe ô tô"
 }
 
-# ===== CAMERA =====
+translation_cache = {}
+
+# ================== LOGIC LOAD/SAVE BẢN DỊCH ==================
+def load_translations():
+    if os.path.exists(TRANSLATION_FILE):
+        with open(TRANSLATION_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+def save_translations(data):
+    with open(TRANSLATION_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+
+
+# ================== KHỞI TẠO AI DỊCH (CHỈ LOAD 1 LẦN) ==================
+print("Đang khởi động bộ não AI dịch (vui lòng đợi giây lát)...")
+model_name = "Helsinki-NLP/opus-mt-en-vi"
+tokenizer = MarianTokenizer.from_pretrained(model_name)
+translator_model = MarianMTModel.from_pretrained(model_name)
+
+def translate_with_ai(english_text):
+    """Hàm này giờ chỉ thực hiện dịch, không load lại model nữa"""
+    try:
+        inputs = tokenizer(english_text.lower(), return_tensors="pt", padding=True)
+        translated = translator_model.generate(**inputs)
+        result = tokenizer.decode(translated[0], skip_special_tokens=True)
+        return result.lower().replace("một ", "").strip()
+    except:
+        return english_text
+
+# Sau đó mới đến vòng lặp kiểm tra và dịch labels
+translation_cache = load_translations()
+needs_save = False
+
+for idx, name in model.names.items():
+    if name not in translation_cache:
+        if name in label_map:
+            translation_cache[name] = label_map[name]
+        else:
+            print(f"-> Đang dịch từ mới: {name}")
+            translation_cache[name] = translate_with_ai(name)
+        needs_save = True
+
+if needs_save:
+    save_translations(translation_cache)
+    print("Đã lưu bản dịch mới vào file!")
+else:
+    print("Đã tải bản dịch từ file thành công.")
+
+# ================== ÂM THANH & CAMERA (Giữ nguyên logic cũ) ==================
+pygame.mixer.init()
+is_speaking = False
+
+def speak(text):
+    global is_speaking
+    if is_speaking: return
+    def run():
+        global is_speaking
+        is_speaking = True
+        try:
+            tts = gTTS(text=text, lang='vi')
+            tts.save("voice.mp3")
+            pygame.mixer.music.load("voice.mp3")
+            pygame.mixer.music.play()
+            while pygame.mixer.music.get_busy(): time.sleep(0.1)
+            pygame.mixer.music.unload()
+            if os.path.exists("voice.mp3"): os.remove("voice.mp3")
+        except: pass
+        is_speaking = False
+    threading.Thread(target=run, daemon=True).start()
+
 cap = cv2.VideoCapture(0)
-
 last_speak_time = 0
+last_objects = set()
 
-while True:
-    start_time = time.time()
-
+while cap.isOpened():
     ret, frame = cap.read()
-    if not ret:
-        break
+    if not ret: break
 
-    # ===== YOLOv8 DETECT =====
-    results = model(frame, conf=0.4)
-
-    detected_objects = []
+    results = model(frame, conf=0.5, imgsz=416, verbose=False)
+    current_frame_labels = []
 
     for r in results:
-        boxes = r.boxes
-
-        for box in boxes:
-            cls_id = int(box.cls[0])
-            conf = float(box.conf[0])
-            label = model.names[cls_id]
-
-            detected_objects.append(label)
-
+        for box in r.boxes:
+            label_eng = model.names[int(box.cls[0])]
+            label_vn = translation_cache.get(label_eng, label_eng)
+            current_frame_labels.append(label_vn)
+            
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-
-            text = f"{label} {int(conf*100)}%"
-
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
-            cv2.putText(frame, text, (x1, y1-10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                        (0,255,0), 2)
-
-    cv2.imshow("YOLOv8 Detection", frame)
-
-    if cv2.waitKey(1) & 0xFF == 27:
-        break
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(frame, label_vn, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
     if time.time() - last_speak_time > 3:
+        unique_objects = list(set(current_frame_labels))
+        if unique_objects and set(unique_objects) != last_objects:
+            speak("Phía trước có " + ", ".join(unique_objects[:3]))
+            last_objects = set(unique_objects)
+            last_speak_time = time.time()
 
-        if detected_objects:
-            vn_labels = [label_map.get(obj, obj) for obj in set(detected_objects)]
-            voice_text = "Phía trước bạn có " + ", ".join(vn_labels)
-        else:
-            voice_text = "Phía trước bạn không có vật thể"
-
-        print("VOICE:", voice_text)
-
-        speak(voice_text)
-
-        last_speak_time = time.time()
-
-    end_time = time.time()
-    print("FPS:", int(1/(end_time - start_time)))
+    cv2.imshow("AI Vision Optimized", frame)
+    if cv2.waitKey(1) & 0xFF == 27: break
 
 cap.release()
 cv2.destroyAllWindows()
